@@ -14,8 +14,17 @@ describe("DecentraVote", function () {
       hre.ethers.encodeBytes32String("Candidate C"),
     ];
 
+    const currentTime = Math.floor(Date.now() / 1000);
+    const votingStartTime = currentTime + 60; // Start in 1 minute
+    const votingEndTime = currentTime + 600; // End in 10 minutes
+
     const DecentraVote = await hre.ethers.getContractFactory("DecentraVote");
-    const voting = await DecentraVote.deploy(topic, proposalNames);
+    const voting = await DecentraVote.deploy(
+      topic,
+      proposalNames,
+      votingStartTime,
+      votingEndTime
+    );
     await voting.waitForDeployment();
 
     return {
@@ -27,6 +36,8 @@ describe("DecentraVote", function () {
       nonRegistered,
       topic,
       proposalNames,
+      votingStartTime,
+      votingEndTime,
     };
   }
 
@@ -53,7 +64,7 @@ describe("DecentraVote", function () {
 
     it("Should start with voting inactive", async function () {
       const { voting } = await loadFixture(deployVotingFixture);
-      expect(await voting.votingActive()).to.be.false;
+      expect(await voting.isVotingActive()).to.be.false;
     });
   });
 
@@ -75,6 +86,17 @@ describe("DecentraVote", function () {
       );
     });
 
+    it("Should allow batch voter registration", async function () {
+      const { voting, voter1, voter2 } = await loadFixture(deployVotingFixture);
+      await voting.batchRegisterVoters([voter1.address, voter2.address]);
+
+      const voter1Info = await voting.voters(voter1.address);
+      const voter2Info = await voting.voters(voter2.address);
+
+      expect(voter1Info.isRegistered).to.be.true;
+      expect(voter2Info.isRegistered).to.be.true;
+    });
+
     it("Should prevent non-admins from registering voters", async function () {
       const { voting, voter1, voter2 } = await loadFixture(deployVotingFixture);
       await expect(
@@ -84,32 +106,17 @@ describe("DecentraVote", function () {
   });
 
   describe("Voting Process", function () {
-    it("Should allow admin to start and stop voting", async function () {
-      const { voting } = await loadFixture(deployVotingFixture);
-
-      await expect(voting.startVoting()).to.emit(voting, "VotingStarted");
-      expect(await voting.votingActive()).to.be.true;
-
-      await expect(voting.endVoting()).to.emit(voting, "VotingEnded");
-      expect(await voting.votingActive()).to.be.false;
-    });
-
-    it("Should prevent non-admins from starting/stopping voting", async function () {
-      const { voting, voter1 } = await loadFixture(deployVotingFixture);
-      await expect(voting.connect(voter1).startVoting()).to.be.revertedWith(
-        "Only admin can call this function"
-      );
-      await expect(voting.connect(voter1).endVoting()).to.be.revertedWith(
-        "Only admin can call this function"
-      );
-    });
-
-    it("Should allow registered voters to cast votes", async function () {
-      const { voting, voter1 } = await loadFixture(deployVotingFixture);
-      const proposalIndex = 1; // Voting for Candidate B
+    it("Should allow registered voters to cast votes during the voting period", async function () {
+      const { voting, voter1, votingStartTime, votingEndTime } =
+        await loadFixture(deployVotingFixture);
+      const proposalIndex = 1;
 
       await voting.registerVoter(voter1.address);
-      await voting.startVoting();
+      await hre.network.provider.send("evm_setNextBlockTimestamp", [
+        votingStartTime + 1,
+      ]);
+      await hre.network.provider.send("evm_mine");
+
       await expect(voting.connect(voter1).castVote(proposalIndex))
         .to.emit(voting, "VoteCasted")
         .withArgs(voter1.address, proposalIndex);
@@ -117,21 +124,62 @@ describe("DecentraVote", function () {
       expect(voter.hasVoted).to.be.true;
     });
 
-    it("Should prevent non-registered voters from voting", async function () {
-      const { voting, nonRegistered } = await loadFixture(deployVotingFixture);
+    it("Should prevent voting before the start time", async function () {
+      const { voting, voter1 } = await loadFixture(deployVotingFixture);
       const proposalIndex = 0;
-      await voting.startVoting();
+      await voting.registerVoter(voter1.address);
+
+      await expect(
+        voting.connect(voter1).castVote(proposalIndex)
+      ).to.be.revertedWith("Voting has not started yet");
+    });
+
+    it("Should prevent voting after the end time", async function () {
+      const { voting, voter1, votingEndTime } = await loadFixture(
+        deployVotingFixture
+      );
+      const proposalIndex = 0;
+      await voting.registerVoter(voter1.address);
+
+      await hre.network.provider.send("evm_setNextBlockTimestamp", [
+        votingEndTime + 1,
+      ]);
+      await hre.network.provider.send("evm_mine");
+
+      await expect(
+        voting.connect(voter1).castVote(proposalIndex)
+      ).to.be.revertedWith("Voting has ended");
+    });
+
+    it("Should prevent non-registered voters from voting", async function () {
+      const { voting, nonRegistered, votingStartTime } = await loadFixture(
+        deployVotingFixture
+      );
+      const proposalIndex = 0;
+
+      await hre.network.provider.send("evm_setNextBlockTimestamp", [
+        votingStartTime + 1,
+      ]);
+      await hre.network.provider.send("evm_mine");
+
       await expect(
         voting.connect(nonRegistered).castVote(proposalIndex)
       ).to.be.revertedWith("Voter is not registered");
     });
 
     it("Should prevent voters from voting twice", async function () {
-      const { voting, voter1 } = await loadFixture(deployVotingFixture);
-      const proposalIndex = 2; // Voting for Candidate C
+      const { voting, voter1, votingStartTime } = await loadFixture(
+        deployVotingFixture
+      );
+      const proposalIndex = 2;
 
       await voting.registerVoter(voter1.address);
-      await voting.startVoting();
+
+      await hre.network.provider.send("evm_setNextBlockTimestamp", [
+        votingStartTime + 1,
+      ]);
+      await hre.network.provider.send("evm_mine");
+
       await voting.connect(voter1).castVote(proposalIndex);
       await expect(
         voting.connect(voter1).castVote(proposalIndex)
@@ -139,34 +187,38 @@ describe("DecentraVote", function () {
     });
 
     it("Should count votes correctly", async function () {
-      const { voting, voter1, voter2 } = await loadFixture(deployVotingFixture);
+      const { voting, voter1, voter2, votingStartTime } = await loadFixture(
+        deployVotingFixture
+      );
       const proposalIndex = 1;
 
       await voting.registerVoter(voter1.address);
       await voting.registerVoter(voter2.address);
-      await voting.startVoting();
+
+      await hre.network.provider.send("evm_setNextBlockTimestamp", [
+        votingStartTime + 1,
+      ]);
+      await hre.network.provider.send("evm_mine");
+
       await voting.connect(voter1).castVote(proposalIndex);
       await voting.connect(voter2).castVote(proposalIndex);
-      await voting.endVoting();
 
       const proposal = await voting.proposals(proposalIndex);
       expect(proposal.voteCount).to.equal(2);
     });
   });
 
-  describe("Winner Calculation", function () {
-    it("Should return the correct winning proposal", async function () {
-      const { voting, voter1, voter2 } = await loadFixture(deployVotingFixture);
-      const proposalIndex = 0;
+  describe("Proposal Management", function () {
+    it("Should allow admin to add proposals before voting starts", async function () {
+      const { voting } = await loadFixture(deployVotingFixture);
+      const newProposal = hre.ethers.encodeBytes32String("Candidate D");
 
-      await voting.registerVoter(voter1.address);
-      await voting.registerVoter(voter2.address);
-      await voting.startVoting();
-      await voting.connect(voter1).castVote(proposalIndex);
-      await voting.connect(voter2).castVote(proposalIndex);
-      await voting.endVoting();
+      await expect(voting.addProposal(newProposal))
+        .to.emit(voting, "ProposalCreated")
+        .withArgs(newProposal);
 
-      expect(await voting.winningProposal()).to.equal(proposalIndex);
+      const proposal = await voting.proposals(3);
+      expect(proposal.name).to.equal(newProposal);
     });
   });
 });
